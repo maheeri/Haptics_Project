@@ -58,13 +58,6 @@ Description:
 static HHD ghHD = HD_INVALID_HANDLE;
 static HHLRC ghHLRC = 0;
 
-/* Shape id for shape we will render haptically. */
-HLuint gSphereShapeId;
-
-#define CURSOR_SIZE_PIXELS 20
-static double gCursorScale;
-static GLuint gCursorDisplayList = 0;
-
 /* Structure with position and rotation data from the device */
 typedef struct 
 {
@@ -72,15 +65,19 @@ typedef struct
 	HLdouble m_quaternion[4]; /* Quaternion defining the rotation */ 
 } DevicePose;
 
+/* Structure with force and torque data from the device */
 typedef struct
 {
 	HDdouble forceValues[3];
     HDdouble jointTorqueValues[3];   
-    HDdouble gimbalTorqueValues[3]; 
+    HDdouble gimbalTorqueValues[3];
+	HDdouble overallTorque[3]; 
 } DeviceForces;
 
+
 static DevicePose poseData;
-static DeviceForces forceData; 
+static DeviceForces forceData;
+static DeviceForces verForceData; // to verify force data --> delete later 
 
 /* Initialize the output file for the data */
 FILE *ofp;
@@ -93,109 +90,14 @@ SYSTEMTIME begin;
 /* Publisher for ROS */
 ros::Publisher pose; 
 
-/* Function prototypes. */
-void glutDisplay(void);
-void glutReshape(int width, int height);
-void glutIdle(void);   
-void glutMenu(int);
-
-void rosCall(void); 
-
-void exitHandler(void);
-
-void initGL();
-void initHL();
-void initScene();
-void drawSceneHaptics();
-void drawSceneGraphics();
-void drawCursor();
-void updateWorkspace();
-
-/*******************************************************************************
- HD callback code to apply force feedback to the haptic device. 
-*******************************************************************************/
-HDCallbackCode HDCALLBACK applyForce(void *pUserData)
-{
-	HHD hHD = hdGetCurrentDevice();
-	hdBeginFrame(hHD);
-
-	forceData.forceValues[0] = -0.3;
-	forceData.forceValues[1] = -0.3;
-	forceData.forceValues[2] = -0.3;
-
-	hdSetDoublev(HD_CURRENT_FORCE, forceData.forceValues);
-	fprintf(stdout, "%g, %g, %g \n", forceData.forceValues[0], forceData.forceValues[1], forceData.forceValues[2]);
-
-	hdEndFrame(hHD);
-
-    return HD_CALLBACK_CONTINUE;
-}
-
-/*******************************************************************************
- Initializes GLUT for displaying a simple haptic scene.
-*******************************************************************************/
-int main(int argc, char *argv[])
-{
-	/* Assign the beginning time of the program */
-	GetSystemTime(&begin);
-
-	/* Open the output file and check for NULL */
-	ofp = fopen(outputFilename, "w");
-
-	if (ofp == NULL) {
-		fprintf(stderr, "Can't open output file %s!\n", outputFilename);
-	 exit(1);
-	}
-
-    glutInit(&argc, argv);
-    
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
-
-    glutInitWindowSize(500, 500);
-    glutCreateWindow("HelloSphere Example");
-
-    // Set glut callback functions.
-    glutDisplayFunc(glutDisplay);
-    glutReshapeFunc(glutReshape);
-    glutIdleFunc(glutIdle);
-    
-    glutCreateMenu(glutMenu);
-    glutAddMenuEntry("Quit", 0);
-    glutAttachMenu(GLUT_RIGHT_BUTTON);    
-    
-    // Provide a cleanup routine for handling application exit.
-    atexit(exitHandler);
-
-    initScene();
-
-	/* Publish ROS messages */
-	std::string name("talker");
- 
-    ros::init(argc, argv, name);
-
-    ros::NodeHandle n;
-
-    pose = n.advertise<geometry_msgs::Pose>("pose", 1000);
-
-	/* Synchornous call to update the force applied to the device */
-	hdScheduleAsynchronous(applyForce, 
-        &poseData, HD_MIN_SCHEDULER_PRIORITY);
-
-    glutMainLoop(); // Starts all registered callbacks 
-
-	/* Close the file */
-	fclose(ofp);
-
-    return 0;
-}
+/* Listener for forces */
+ros::Subscriber listener; 
 
 /*******************************************************************************
  ROS code for publishing messages. 
 *******************************************************************************/
-void rosCall() 
+void rosPubPose() 
 {
-  if (ros::ok())
-  {
     geometry_msgs::Pose pose_msg;
     geometry_msgs::Point point_msg;
     geometry_msgs::Quaternion or_msg;
@@ -213,63 +115,14 @@ void rosCall()
     pose_msg.orientation = or_msg;
 
 	pose.publish(pose_msg); 
-  }
 }
 
-/*******************************************************************************
- GLUT callback for redrawing the view.
-*******************************************************************************/
-void glutDisplay()
-{   
-    drawSceneHaptics();
-
-    drawSceneGraphics();
-
-    glutSwapBuffers();
-}
 
 /*******************************************************************************
- GLUT callback for reshaping the window.  This is the main place where the 
- viewing and workspace transforms get initialized.
+Gets the position and orientation information using HLAPI. 
 *******************************************************************************/
-void glutReshape(int width, int height)
+void hlPoseInfo()
 {
-    static const double kPI = 3.1415926535897932384626433832795;
-    static const double kFovY = 40;
-
-    double nearDist, farDist, aspect;
-
-    glViewport(0, 0, width, height);
-
-    // Compute the viewing parameters based on a fixed fov and viewing
-    // a canonical box centered at the origin.
-
-    nearDist = 1.0 / tan((kFovY / 2.0) * kPI / 180.0);
-    farDist = nearDist + 2.0;
-    aspect = (double) width / height;
-   
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    gluPerspective(kFovY, aspect, nearDist, farDist);
-
-    // Place the camera down the Z axis looking at the origin.
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();            
-    gluLookAt(0, 0, nearDist + 1.0,
-              0, 0, 0,
-              0, 1, 0);
-    
-    updateWorkspace();
-}
-
-/*******************************************************************************
- GLUT callback for idle state.  Use this as an opportunity to request a redraw.
- Checks for HLAPI errors that have occurred since the last idle check.
-*******************************************************************************/
-void glutIdle()
-{
-	rosCall();
-
 	/* Get the time right now */
 	SYSTEMTIME now;
 	GetSystemTime(&now);
@@ -302,68 +155,8 @@ void glutIdle()
 	//			poseData.m_quaternion[3],
 	//			(now.wMinute*60*1000 + now.wSecond*1000 + now.wMilliseconds) - 
 	//			(begin.wMinute*60*1000 + begin.wSecond * 1000 + begin.wMilliseconds));
-
-	//forceData.forceValues[0] = 1;
-	//forceData.forceValues[1] = 1;
-	//forceData.forceValues[2] = 1;
-
-	//hdSetDoublev(HD_CURRENT_FORCE, forceData.forceValues);
-	fprintf(stdout, "%g, %g, %g \n", forceData.forceValues[0], forceData.forceValues[1], forceData.forceValues[2]);
-
-    glutPostRedisplay();
 }
 
-/******************************************************************************
- Popup menu handler.
-******************************************************************************/
-void glutMenu(int ID)
-{
-    switch(ID) {
-        case 0:
-            exit(0);
-            break;
-    }
-}
-
-/*******************************************************************************
- Initializes the scene.  Handles initializing both OpenGL and HL.
-*******************************************************************************/
-void initScene()
-{
-    initGL();
-    initHL();
-}
-
-/*******************************************************************************
- Sets up general OpenGL rendering properties: lights, depth buffering, etc.
-*******************************************************************************/
-void initGL()
-{
-    static const GLfloat light_model_ambient[] = {0.3f, 0.3f, 0.3f, 1.0f};
-    static const GLfloat light0_diffuse[] = {0.9f, 0.9f, 0.9f, 0.9f};   
-    static const GLfloat light0_direction[] = {0.0f, -0.4f, 1.0f, 0.0f};    
-    
-    // Enable depth buffering for hidden surface removal.
-    glDepthFunc(GL_LEQUAL);
-    glEnable(GL_DEPTH_TEST);
-    
-    // Cull back faces.
-    glCullFace(GL_BACK);
-    glEnable(GL_CULL_FACE);
-    
-    // Setup other misc features.
-    glEnable(GL_LIGHTING);
-    glEnable(GL_NORMALIZE);
-    glShadeModel(GL_SMOOTH);
-    
-    // Setup lighting model.
-    glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_FALSE);
-    glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_FALSE);    
-    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, light_model_ambient);
-    glLightfv(GL_LIGHT0, GL_DIFFUSE, light0_diffuse);
-    glLightfv(GL_LIGHT0, GL_POSITION, light0_direction);
-    glEnable(GL_LIGHT0);   
-}
 
 /*******************************************************************************
  Initialize the HDAPI.  This involves initing a device configuration, enabling
@@ -385,14 +178,6 @@ void initHL()
     ghHLRC = hlCreateContext(ghHD);
     hlMakeCurrent(ghHLRC);
 
-    // Enable optimization of the viewing parameters when rendering
-    // geometry for OpenHaptics.
-    hlEnable(HL_HAPTIC_CAMERA_VIEW);
-
-    // Generate id for the shape.
-    gSphereShapeId = hlGenShapes(1);
-
-    hlTouchableFace(HL_FRONT);
 }
 
 /*******************************************************************************
@@ -401,9 +186,6 @@ void initHL()
 *******************************************************************************/
 void exitHandler()
 {
-    // Deallocate the sphere shape id we reserved in initHL.
-    hlDeleteShapes(gSphereShapeId, 1);
-
     // Free up the haptic rendering context.
     hlMakeCurrent(NULL);
     if (ghHLRC != NULL)
@@ -419,120 +201,140 @@ void exitHandler()
 }
 
 /*******************************************************************************
- Use the current OpenGL viewing transforms to initialize a transform for the
- haptic device workspace so that it's properly mapped to world coordinates.
+Read out forces to verify if they are the same as the ones applied.  
 *******************************************************************************/
-void updateWorkspace()
+void verifyForces() 
 {
-    GLdouble modelview[16];
-    GLdouble projection[16];
-    GLint viewport[4];
+	ghHD = hdGetCurrentDevice();
+	hdBeginFrame(ghHD);
 
-    glGetDoublev(GL_MODELVIEW_MATRIX, modelview);
-    glGetDoublev(GL_PROJECTION_MATRIX, projection);
-    glGetIntegerv(GL_VIEWPORT, viewport);
+	hdGetDoublev(HD_CURRENT_FORCE, verForceData.forceValues);
+	fprintf(stdout, "%g, %g, %g \n", verForceData.forceValues[0], verForceData.forceValues[1], verForceData.forceValues[2]);
 
-    hlMatrixMode(HL_TOUCHWORKSPACE);
-    hlLoadIdentity();
-    
-    // Fit haptic workspace to view volume.
-    hluFitWorkspace(projection);
-
-    // Compute cursor scale.
-    gCursorScale = hluScreenToModelScale(modelview, projection, viewport);
-    gCursorScale *= CURSOR_SIZE_PIXELS;
+	hdEndFrame(ghHD);
 }
 
 /*******************************************************************************
- The main routine for displaying the scene.  Gets the latest snapshot of state
- from the haptic thread and uses it to display a 3D cursor.
+Read out torques to verify if they are the same as the ones applied.  
 *******************************************************************************/
-void drawSceneGraphics()
+void verifyTorques() 
 {
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);           
+	ghHD = hdGetCurrentDevice();
+	hdBeginFrame(ghHD);
 
-    // Draw 3D cursor at haptic device position.
-    drawCursor();
+	hdGetDoublev(HD_CURRENT_TORQUE, verForceData.overallTorque);
+	fprintf(stdout, "%g, %g, %g \n", verForceData.overallTorque[0], verForceData.overallTorque[1], verForceData.overallTorque[2]);
 
-    // Draw a sphere using OpenGL.
-    //glutSolidSphere(0.5, 32, 32);
+	hdEndFrame(ghHD);
 }
 
 /*******************************************************************************
- The main routine for rendering scene haptics.
+ HD code to apply force feedback to the haptic device. 
 *******************************************************************************/
-void drawSceneHaptics()
-{    
-    // Start haptic frame.  (Must do this before rendering any haptic shapes.)
-    hlBeginFrame();
+HDCallbackCode HDCALLBACK applyForceHD(void* pUserData)
+{
+	ghHD = hdGetCurrentDevice();
+	hdBeginFrame(ghHD);
 
-    // Set material properties for the shapes to be drawn.
-    hlMaterialf(HL_FRONT_AND_BACK, HL_STIFFNESS, 0.7f);
-    hlMaterialf(HL_FRONT_AND_BACK, HL_DAMPING, 0.1f);
-    hlMaterialf(HL_FRONT_AND_BACK, HL_STATIC_FRICTION, 0.2f);
-    hlMaterialf(HL_FRONT_AND_BACK, HL_DYNAMIC_FRICTION, 0.3f);
+	forceData.forceValues[0] = -0.5;
+	forceData.forceValues[1] = -0.5;
+	forceData.forceValues[2] = -0.5;
 
-    // Start a new haptic shape.  Use the feedback buffer to capture OpenGL 
-    // geometry for haptic rendering.
-    hlBeginShape(HL_SHAPE_FEEDBACK_BUFFER, gSphereShapeId);
+	hdSetDoublev(HD_CURRENT_FORCE, forceData.forceValues);
+	//fprintf(ofp, "%g, %g, %g \n", forceData.forceValues[0], forceData.forceValues[1], forceData.forceValues[2]);
 
-    // Use OpenGL commands to create geometry.
-    //glutSolidSphere(0.5, 32, 32);
+	hdEndFrame(ghHD);
 
-    // End the shape.
-    hlEndShape();
-
-    // End the haptic frame.
-    hlEndFrame();
+	return HD_CALLBACK_CONTINUE; 
 }
-
 
 /*******************************************************************************
- Draws a 3D cursor for the haptic device using the current local transform,
- the workspace to world transform and the screen coordinate scale.
+ HD code to apply torque feedback to the haptic device. 
 *******************************************************************************/
-void drawCursor()
+HDCallbackCode HDCALLBACK applyTorqueHD(void* pUserData)
 {
-    static const double kCursorRadius = 0.5;
-    static const double kCursorHeight = 1.5;
-    static const int kCursorTess = 15;
-    HLdouble proxyxform[16];
+	ghHD = hdGetCurrentDevice();
+	hdBeginFrame(ghHD);
 
-    GLUquadricObj *qobj = 0;
+	forceData.overallTorque[0] = -8;
+	forceData.overallTorque[1] = 0;
+	forceData.overallTorque[2] = 0;
 
-    glPushAttrib(GL_CURRENT_BIT | GL_ENABLE_BIT | GL_LIGHTING_BIT);
-    glPushMatrix();
+	hdSetDoublev(HD_CURRENT_TORQUE, forceData.overallTorque);
 
-    if (!gCursorDisplayList)
-    {
-        gCursorDisplayList = glGenLists(1);
-        glNewList(gCursorDisplayList, GL_COMPILE);
-        qobj = gluNewQuadric();
-               
-        gluCylinder(qobj, 0.0, kCursorRadius, kCursorHeight,
-                    kCursorTess, kCursorTess);
-        glTranslated(0.0, 0.0, kCursorHeight);
-        gluCylinder(qobj, kCursorRadius, 0.0, kCursorHeight / 5.0,
-                    kCursorTess, kCursorTess);
-    
-        gluDeleteQuadric(qobj);
-        glEndList();
-    }
-    
-    // Get the proxy transform in world coordinates.
-    hlGetDoublev(HL_PROXY_TRANSFORM, proxyxform);
-    glMultMatrixd(proxyxform);
+	hdEndFrame(ghHD);
 
-    // Apply the local cursor scale factor.
-    glScaled(gCursorScale, gCursorScale, gCursorScale);
-
-    glEnable(GL_COLOR_MATERIAL);
-    glColor3f(0.0, 0.5, 1.0);
-
-    glCallList(gCursorDisplayList);
-
-    glPopMatrix(); 
-    glPopAttrib();
+	return HD_CALLBACK_CONTINUE; 
+}
+/*******************************************************************************
+ ROS Callback code for listening to forces. *Listening to pose right now*
+*******************************************************************************/
+void forceCallback(const geometry_msgs::Pose::ConstPtr& force) 
+{
+	ROS_INFO("x coordinate for pose: [%g]", force->position.x);
 }
 
+/*******************************************************************************
+ Initializes GLUT for displaying a simple haptic scene.
+*******************************************************************************/
+int main(int argc, char *argv[])
+{
+	/* Assign the beginning time of the program */
+	GetSystemTime(&begin);
+
+	/* Open the output file and check for NULL */
+	ofp = fopen(outputFilename, "w");
+
+	if (ofp == NULL) {
+		fprintf(stderr, "Can't open output file %s!\n", outputFilename);
+	 exit(1);
+	}  
+
+	initHL(); // Start HL
+
+    // Provide a cleanup routine for handling application exit.
+    atexit(exitHandler);
+
+	/* Publish ROS messages */
+	std::string name("talker");
+    ros::init(argc, argv, name);
+    ros::NodeHandle n;
+    pose = n.advertise<geometry_msgs::Pose>("pose", 1000);
+
+	/* Create a listener for forces also */
+	std::string name2("listener");
+	ros::init(argc, argv, name2);
+	ros::NodeHandle n2;
+	listener = n2.subscribe("pose", 1000, forceCallback);
+
+
+	/* Synchornous call to update the force applied to the device */
+	/*hdScheduleSynchronous(applyForceHD, 
+        (void*) 0, HD_DEFAULT_SCHEDULER_PRIORITY);*/
+
+	/* Synchornous call to update the torque applied to the device */
+	hdScheduleSynchronous(applyTorqueHD, 
+        (void*) 0, HD_DEFAULT_SCHEDULER_PRIORITY);
+
+	ros::Rate rate(1000.0);
+	while (ros::ok()){
+		hlBeginFrame();
+
+		rosPubPose();
+		hlPoseInfo();
+		//verifyForces(); // to confirm if forces are the ones applied 
+		verifyTorques();
+		//applyForce(); 
+
+		hlEndFrame();
+
+		//ros::spinOnce(); 
+		rate.sleep();
+  }
+
+	/* Close the file */
+	fclose(ofp);
+
+    return 0;
+}
 /******************************************************************************/

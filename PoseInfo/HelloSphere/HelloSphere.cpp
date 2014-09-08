@@ -27,6 +27,7 @@ Description:
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/Quaternion.h>
+#include <geometry_msgs/Wrench.h>
 
 #include <stdlib.h>
 #include <math.h>
@@ -70,8 +71,10 @@ typedef struct
 {
 	HDdouble forceValues[3];
     HDdouble jointTorqueValues[3];   
-    HDdouble gimbalTorqueValues[3]; 
+    HDdouble gimbalTorqueValues[3];
+	HDdouble overallTorque[3]; 
 } DeviceForces;
+
 
 static DevicePose poseData;
 static DeviceForces forceData;
@@ -88,8 +91,11 @@ SYSTEMTIME begin;
 /* Publisher for ROS */
 ros::Publisher pose; 
 
+/* Test Wrench publisher */
+ros::Publisher wrenches; 
+
 /* Listener for forces */
-ros::Subscriber listener; 
+ros::Subscriber wrenchlistener; 
 
 /*******************************************************************************
  ROS code for publishing messages. 
@@ -115,6 +121,23 @@ void rosPubPose()
 	pose.publish(pose_msg); 
 }
 
+/*******************************************************************************
+ ROS code for publishing forces and torques. 
+*******************************************************************************/
+void rosPubWrench()
+{
+	geometry_msgs::Wrench wrench_msg;
+	
+	wrench_msg.force.x = -0.3;
+	wrench_msg.force.y = -0.3;
+	wrench_msg.force.z = -0.3;
+
+	wrench_msg.torque.x = 0;
+	wrench_msg.torque.y = 0;
+	wrench_msg.torque.z = 0;
+
+	wrenches.publish(wrench_msg); 
+}
 
 /*******************************************************************************
 Gets the position and orientation information using HLAPI. 
@@ -213,19 +236,15 @@ void verifyForces()
 }
 
 /*******************************************************************************
- Code to apply force feedback to the haptic device. 
+Read out torques to verify if they are the same as the ones applied.  
 *******************************************************************************/
-void applyForce()
+void verifyTorques() 
 {
 	ghHD = hdGetCurrentDevice();
 	hdBeginFrame(ghHD);
 
-	forceData.forceValues[0] = -0.3;
-	forceData.forceValues[1] = -0.3;
-	forceData.forceValues[2] = -0.3;
-
-	hdSetDoublev(HD_CURRENT_FORCE, forceData.forceValues);
-	//fprintf(ofp, "%g, %g, %g \n", forceData.forceValues[0], forceData.forceValues[1], forceData.forceValues[2]);
+	hdGetDoublev(HD_CURRENT_TORQUE, verForceData.overallTorque);
+	fprintf(stdout, "%g, %g, %g \n", verForceData.overallTorque[0], verForceData.overallTorque[1], verForceData.overallTorque[2]);
 
 	hdEndFrame(ghHD);
 }
@@ -238,9 +257,9 @@ HDCallbackCode HDCALLBACK applyForceHD(void* pUserData)
 	ghHD = hdGetCurrentDevice();
 	hdBeginFrame(ghHD);
 
-	forceData.forceValues[0] = -0.1;
-	forceData.forceValues[1] = -0.1;
-	forceData.forceValues[2] = -0.1;
+	/*forceData.forceValues[0] = -0.5;
+	forceData.forceValues[1] = -0.5;
+	forceData.forceValues[2] = -0.5;*/
 
 	hdSetDoublev(HD_CURRENT_FORCE, forceData.forceValues);
 	//fprintf(ofp, "%g, %g, %g \n", forceData.forceValues[0], forceData.forceValues[1], forceData.forceValues[2]);
@@ -249,12 +268,36 @@ HDCallbackCode HDCALLBACK applyForceHD(void* pUserData)
 
 	return HD_CALLBACK_CONTINUE; 
 }
+
 /*******************************************************************************
- ROS Callback code for listening to forces. *Listening to pose right now*
+ HD code to apply torque feedback to the haptic device. 
 *******************************************************************************/
-void forceCallback(const geometry_msgs::Pose::ConstPtr& force) 
+HDCallbackCode HDCALLBACK applyTorqueHD(void* pUserData)
 {
-	ROS_INFO("x coordinate for pose: [%g]", force->position.x);
+	ghHD = hdGetCurrentDevice();
+	hdBeginFrame(ghHD);
+
+	forceData.overallTorque[0] = -8;
+	forceData.overallTorque[1] = 0;
+	forceData.overallTorque[2] = 0;
+
+	hdSetDoublev(HD_CURRENT_TORQUE, forceData.overallTorque);
+
+	hdEndFrame(ghHD);
+
+	return HD_CALLBACK_CONTINUE; 
+}
+/*******************************************************************************
+ ROS Callback code for listening to wrenches. 
+*******************************************************************************/
+void wrenchCallback(const geometry_msgs::Wrench::ConstPtr& wrench) 
+{
+	forceData.forceValues[0] = wrench->force.x;
+	forceData.forceValues[1] = wrench->force.y;
+	forceData.forceValues[2] = wrench->force.z;
+	forceData.overallTorque[0] = wrench->torque.x;
+	forceData.overallTorque[1] = wrench->torque.y;
+	forceData.overallTorque[2] = wrench->torque.z;
 }
 
 /*******************************************************************************
@@ -284,29 +327,39 @@ int main(int argc, char *argv[])
     ros::NodeHandle n;
     pose = n.advertise<geometry_msgs::Pose>("pose", 1000);
 
-	/* Create a listener for forces also */
-	std::string name2("listener");
+	/* Test ROS code to publish wrenches and check for their receipt */
+	std::string name2("wrenches");
 	ros::init(argc, argv, name2);
 	ros::NodeHandle n2;
-	listener = n2.subscribe("pose", 1000, forceCallback);
+	wrenches = n2.advertise<geometry_msgs::Wrench>("wrenches", 1000);
 
+	/* Create a listener for wrenches also */
+	std::string name3("wrenchlistener");
+	ros::init(argc, argv, name3);
+	ros::NodeHandle n3;
+	wrenchlistener = n3.subscribe("wrenches", 1000, wrenchCallback);
 
 	/* Synchornous call to update the force applied to the device */
-	hdScheduleAsynchronous(applyForceHD, 
+	hdScheduleSynchronous(applyForceHD, 
         (void*) 0, HD_DEFAULT_SCHEDULER_PRIORITY);
+
+	/* Synchornous call to update the torque applied to the device */
+	/*hdScheduleSynchronous(applyTorqueHD, 
+        (void*) 0, HD_DEFAULT_SCHEDULER_PRIORITY);*/
 
 	ros::Rate rate(1000.0);
 	while (ros::ok()){
 		hlBeginFrame();
 
 		rosPubPose();
+		rosPubWrench(); 
 		hlPoseInfo();
 		verifyForces(); // to confirm if forces are the ones applied 
-		//applyForce(); 
+		//verifyTorques();
 
 		hlEndFrame();
 
-		//ros::spinOnce(); 
+		ros::spinOnce(); 
 		rate.sleep();
   }
 
