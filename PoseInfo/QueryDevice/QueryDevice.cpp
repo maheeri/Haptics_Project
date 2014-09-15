@@ -1,310 +1,356 @@
 /*****************************************************************************
+This module retrieves position information from the haptic device and conveys
+it over ROS messages to the robot arm. It also receives force feedback conveyed
+to the haptic device from the robot arm.
+******************************************************************************/
 
-Copyright (c) 2004 SensAble Technologies, Inc. All rights reserved.
+//ROS includes 
+#include <string>
+#include <iostream>
+#include <sstream>
+#include <ros/ros.h>
+#include <std_msgs/String.h>
+#include <geometry_msgs/Pose.h>
+#include <geometry_msgs/Point.h>
+#include <geometry_msgs/Quaternion.h>
+#include <geometry_msgs/Wrench.h>
 
-OpenHaptics(TM) toolkit. The material embodied in this software and use of
-this software is subject to the terms and conditions of the clickthrough
-Development License Agreement.
-
-For questions, comments or bug reports, go to forums at: 
-    http://dsc.sensable.com
-
-Module Name:
-  
-  QueryDevice.c
-
-Description:
-
-  This example demonstrates how to retrieve information from the haptic device.
-
-*******************************************************************************/
-#ifdef _MSC_VER
-#define _CRT_SECURE_NO_WARNINGS
-#endif
-
-#ifdef  _WIN64
-#pragma warning (disable:4996)
-#endif
-
-#if defined(WIN32)
-# include <windows.h>
-# include <conio.h>
-#else
-# include "conio.h"
-# include <string.h>
-#endif
-
-#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 #include <assert.h>
 
-#include <HD/hd.h>
-#include <HL/hl.h>
+#if defined(WIN32)
+#include <windows.h>
+#endif
 
-#include <HDU/hduVector.h>
-#include <HDU/hduQuaternion.h>
+#if defined(WIN32) || defined(linux)
+#include <GL/glut.h>
+#elif defined(__APPLE__)
+#include <GLUT/glut.h>
+#endif
+
+#include <HL/hl.h>
+#include <HD/hd.h>
+#include <HDU/hduMatrix.h>
 #include <HDU/hduError.h>
+#include <HDU/hduVector.h>
+
+#include <HLU/hlu.h>
 
 #include <vector>
 
 #include <time.h>
 
-/* Holds data retrieved from HDAPI. */
+/* Haptic device and rendering context handles. */
+static HHD ghHD = HD_INVALID_HANDLE;
+static HHLRC ghHLRC = 0;
+
+/* Structure with position and rotation data from the device */
 typedef struct 
 {
-    HDboolean m_buttonState;       /* Has the device button has been pressed. */
     hduVector3Dd m_devicePosition; /* Current device coordinates. */
-	hduVector3Dd m_gimbalRotation; /* Current gimbal rotation - x, y and z */
 	HLdouble m_quaternion[4]; /* Quaternion defining the rotation */ 
-    HDErrorInfo m_error;
-} DeviceData;
+} DevicePose;
 
-static DeviceData gServoDeviceData;
+/* Structure with force and torque data from the device */
+typedef struct
+{
+	HDdouble forceValues[3];
+    HDdouble jointTorqueValues[3];   
+    HDdouble gimbalTorqueValues[3];
+	HDdouble overallTorque[3]; 
+} DeviceForces;
+
+static DevicePose poseData;
+static DeviceForces forceData;
+static DeviceForces verForceData; // to verify force data --> delete later 
+
+/* Initialize the output file for the data */
+FILE *ofp;
+char *mode = "w";
+char outputFilename[] = "C:\\Users\\robo328\\Desktop\\Haptics_Project\\data.txt";
+
+/* Time at the start of the program - Windows Specific */
+SYSTEMTIME begin;
+
+/* Publisher for ROS */
+ros::Publisher pose; 
+
+/* Test Wrench publisher */
+ros::Publisher wrenches; 
+
+/* Listener for forces */
+ros::Subscriber wrenchlistener; 
 
 /*******************************************************************************
- Checks the state of the gimbal button and gets the position of the device.
+ ROS code for publishing messages. 
 *******************************************************************************/
-HDCallbackCode HDCALLBACK updateDeviceCallback(void *pUserData)
-{   
-    int nButtons = 0;
+void rosPubPose() 
+{
+    geometry_msgs::Pose pose_msg;
+    geometry_msgs::Point point_msg;
+    geometry_msgs::Quaternion or_msg;
 
-    hdBeginFrame(hdGetCurrentDevice());
+    point_msg.x = poseData.m_devicePosition[0];
+    point_msg.y = poseData.m_devicePosition[1];
+    point_msg.z = poseData.m_devicePosition[2];
 
-    /* Retrieve the current button(s). */
-    hdGetIntegerv(HD_CURRENT_BUTTONS, &nButtons);
-    
-    /* In order to get the specific button 1 state, we use a bitmask to
-       test for the HD_DEVICE_BUTTON_1 bit. */
-    gServoDeviceData.m_buttonState = 
-        (nButtons & HD_DEVICE_BUTTON_1) ? HD_TRUE : HD_FALSE;
+    or_msg.x = poseData.m_quaternion[0];
+    or_msg.y = poseData.m_quaternion[1];
+    or_msg.z = poseData.m_quaternion[2];
+    or_msg.w = poseData.m_quaternion[3];
+
+    pose_msg.position = point_msg;
+    pose_msg.orientation = or_msg;
+
+	pose.publish(pose_msg); 
+}
+
+/*******************************************************************************
+ ROS code for publishing forces and torques. 
+*******************************************************************************/
+void rosPubWrench()
+{
+	geometry_msgs::Wrench wrench_msg;
+	
+	wrench_msg.force.x = -0.3;
+	wrench_msg.force.y = -0.3;
+	wrench_msg.force.z = -0.3;
+
+	wrench_msg.torque.x = 0;
+	wrench_msg.torque.y = 0;
+	wrench_msg.torque.z = 0;
+
+	wrenches.publish(wrench_msg); 
+}
+
+/*******************************************************************************
+Gets the position and orientation information using HLAPI. 
+*******************************************************************************/
+void hlPoseInfo()
+{
+	/* Get the time right now */
+	SYSTEMTIME now;
+	GetSystemTime(&now);
+
+    HLerror error;
+
+    while (HL_ERROR(error = hlGetError()))
+    {
+        fprintf(stderr, "HL Error: %s\n", error.errorCode);
         
-    /* Get the current location of the device (HD_GET_CURRENT_POSITION)
-       We declare a vector of three doubles since hdGetDoublev returns 
-       the information in a vector of size 3. */
-    hdGetDoublev(HD_CURRENT_POSITION, gServoDeviceData.m_devicePosition);
+        if (error.errorCode == HL_DEVICE_ERROR)
+        {
+            hduPrintError(stderr, &error.errorInfo,
+                "Error during haptic rendering\n");
+        }
+    }
 
-	/* Get the current quaternion defining the gimbal rotation */
-	hlGetDoublev(HL_DEVICE_ROTATION, gServoDeviceData.m_quaternion);
+	/* Set the current quaternion and device position */
+	hlGetDoublev(HL_DEVICE_ROTATION, poseData.m_quaternion);
+	hdGetDoublev(HD_CURRENT_POSITION, poseData.m_devicePosition); 
 
-    /* Also check the error state of HDAPI. */
-    gServoDeviceData.m_error = hdGetError();
-
-    /* Copy the position into our device_data tructure. */
-    hdEndFrame(hdGetCurrentDevice());
-
-    return HD_CALLBACK_CONTINUE;    
+	////fprintf(ofp, "(x, y, z, r1, r2, r3, w, time): (%g, %g, %g, %g, %g, %g, %g, %ld)\n",
+	fprintf(stdout, "%g, %g, %g, %g, %g, %g, %g, %ld\n",
+                poseData.m_devicePosition[0], 
+                poseData.m_devicePosition[1], 
+                poseData.m_devicePosition[2],
+				poseData.m_quaternion[0],
+				poseData.m_quaternion[1],
+				poseData.m_quaternion[2],
+				poseData.m_quaternion[3],
+				(now.wMinute*60*1000 + now.wSecond*1000 + now.wMilliseconds) - 
+				(begin.wMinute*60*1000 + begin.wSecond * 1000 + begin.wMilliseconds));
 }
 
 
 /*******************************************************************************
- Checks the state of the gimbal button and gets the position of the device.
+ Initialize the HDAPI.  This involves initing a device configuration, enabling
+ forces, and scheduling a haptic thread callback for servicing the device.
 *******************************************************************************/
-HDCallbackCode HDCALLBACK copyDeviceDataCallback(void *pUserData)
+void initHL()
 {
-    DeviceData *pDeviceData = (DeviceData *) pUserData;
+    HDErrorInfo error;
 
-    memcpy(pDeviceData, &gServoDeviceData, sizeof(DeviceData));
+    ghHD = hdInitDevice(HD_DEFAULT_DEVICE);
+    if (HD_DEVICE_ERROR(error = hdGetError()))
+    {
+        hduPrintError(stderr, &error, "Failed to initialize haptic device");
+        fprintf(stderr, "Press any key to exit");
+        getchar();
+        exit(-1);
+    }
+    
+    ghHLRC = hlCreateContext(ghHD);
+    hlMakeCurrent(ghHLRC);
 
-    return HD_CALLBACK_DONE;
 }
 
-
 /*******************************************************************************
- Prints out a help string about using this example.
+ This handler is called when the application is exiting.  Deallocates any state 
+ and cleans up.
 *******************************************************************************/
-void printHelp(void)
+void exitHandler()
 {
-    static const char help[] = {"\
-Press and release the stylus button to print out the current device location.\n\
-Press and hold the stylus button to exit the application\n"};
+    // Free up the haptic rendering context.
+    hlMakeCurrent(NULL);
+    if (ghHLRC != NULL)
+    {
+        hlDeleteContext(ghHLRC);
+    }
 
-    fprintf(stdout, "%s\n", help);
+    // Free up the haptic device.
+    if (ghHD != HD_INVALID_HANDLE)
+    {
+        hdDisableDevice(ghHD);
+    }
 }
 
+/*******************************************************************************
+Read out forces to verify if they are the same as the ones applied.  
+*******************************************************************************/
+void verifyForces() 
+{
+	ghHD = hdGetCurrentDevice();
+	hdBeginFrame(ghHD);
+
+	hdGetDoublev(HD_CURRENT_FORCE, verForceData.forceValues);
+	fprintf(stdout, "%g, %g, %g \n", verForceData.forceValues[0], verForceData.forceValues[1], verForceData.forceValues[2]);
+
+	hdEndFrame(ghHD);
+}
 
 /*******************************************************************************
- This routine allows the device to provide information about the current 
- location of the stylus, and contains a mechanism for terminating the 
- application.  
- Pressing the button causes the application to display the current location
- of the device.  
- Holding the button down for N iterations causes the application to exit. 
+Read out torques to verify if they are the same as the ones applied.  
 *******************************************************************************/
-void mainLoop(void)
-{ 
-	FILE *ofp;
-	char *mode = "w";
-	char outputFilename[] = "C:\\Users\\robo328\\Desktop\\Haptics_Project\\data.txt"; 
+void verifyTorques() 
+{
+	ghHD = hdGetCurrentDevice();
+	hdBeginFrame(ghHD);
 
-    static const int kTerminateCount = 1000;
-    int buttonHoldCount = 0;
+	hdGetDoublev(HD_CURRENT_TORQUE, verForceData.overallTorque);
+	//fprintf(stdout, "%g, %g, %g \n", verForceData.overallTorque[0], verForceData.overallTorque[1], verForceData.overallTorque[2]);
 
-    /* Instantiate the structure used to capture data from the device. */
-    DeviceData currentData;
-    DeviceData prevData;
+	hdEndFrame(ghHD);
+}
 
-	/* Vectors to store the device position and rotation */
-	//HLdouble rotationVector[4]; //Quaternion
-	//HLdouble positionVector[3];
+/*******************************************************************************
+ HD code to apply force feedback to the haptic device. 
+*******************************************************************************/
+HDCallbackCode HDCALLBACK applyForceHD(void* pUserData)
+{
+	ghHD = hdGetCurrentDevice();
+	hdBeginFrame(ghHD);
 
-	/* Get the time at the start of the loop - Windows Specific */
-	SYSTEMTIME begin;
+	/*forceData.forceValues[0] = -0.5;
+	forceData.forceValues[1] = -0.5;
+	forceData.forceValues[2] = -0.5;*/
+
+	hdSetDoublev(HD_CURRENT_FORCE, forceData.forceValues);
+	//fprintf(ofp, "%g, %g, %g \n", forceData.forceValues[0], forceData.forceValues[1], forceData.forceValues[2]);
+
+	hdEndFrame(ghHD);
+
+	return HD_CALLBACK_CONTINUE; 
+}
+
+/*******************************************************************************
+ HD code to apply torque feedback to the haptic device. 
+*******************************************************************************/
+HDCallbackCode HDCALLBACK applyTorqueHD(void* pUserData)
+{
+	ghHD = hdGetCurrentDevice();
+	hdBeginFrame(ghHD);
+
+	forceData.overallTorque[0] = -8;
+	forceData.overallTorque[1] = 0;
+	forceData.overallTorque[2] = 0;
+
+	hdSetDoublev(HD_CURRENT_TORQUE, forceData.overallTorque);
+
+	hdEndFrame(ghHD);
+
+	return HD_CALLBACK_CONTINUE; 
+}
+/*******************************************************************************
+ ROS Callback code for listening to wrenches. 
+*******************************************************************************/
+void wrenchCallback(const geometry_msgs::Wrench::ConstPtr& wrench) 
+{
+	forceData.forceValues[0] = wrench->force.x;
+	forceData.forceValues[1] = wrench->force.y;
+	forceData.forceValues[2] = wrench->force.z;
+	forceData.overallTorque[0] = wrench->torque.x;
+	forceData.overallTorque[1] = wrench->torque.y;
+	forceData.overallTorque[2] = wrench->torque.z;
+}
+
+/*******************************************************************************
+ Initializes GLUT for displaying a simple haptic scene.
+*******************************************************************************/
+int main(int argc, char *argv[])
+{
+	/* Assign the beginning time of the program */
 	GetSystemTime(&begin);
 
-    /* Perform a synchronous call to copy the most current device state. */
-    hdScheduleSynchronous(copyDeviceDataCallback, 
-        &currentData, HD_MIN_SCHEDULER_PRIORITY);
-
-    memcpy(&prevData, &currentData, sizeof(DeviceData));    
-
-    printHelp();
-
+	/* Open the output file and check for NULL */
 	ofp = fopen(outputFilename, "w");
 
 	if (ofp == NULL) {
 		fprintf(stderr, "Can't open output file %s!\n", outputFilename);
 	 exit(1);
-	}
+	}  
 
-    /* Run the main loop until the gimbal button is held. */
-    while (1)
-    {
-		/* Get the time right now */
-		SYSTEMTIME now;
-		GetSystemTime(&now);
+	initHL(); // Start HL
 
-		/* Get and assign the rotation and position vectors */
-		//hlGetDoublev(HL_DEVICE_ROTATION, rotationVector);
-		//hlGetDoublev(HL_DEVICE_POSITION, positionVector);
+    // Provide a cleanup routine for handling application exit.
+    atexit(exitHandler);
 
-		/* Get the time difference in milliseconds from the start of the loop 
-		This isn't working because the word declaration isn't right so I put the
-		entire expression for printing, for now */
-		/* WORD diff;
-		diff = (now.wSecond * 1000 + now.wMilliseconds) - 
-			(begin.wSecond * 1000 + begin.wMilliseconds); */
+	/* Publish ROS messages */
+	std::string name("talker");
+    ros::init(argc, argv, name);
+    ros::NodeHandle n;
+    pose = n.advertise<geometry_msgs::Pose>("hapticsPose", 1000);
 
-        /* Perform a synchronous call to copy the most current device state.
-           This synchronous scheduler call ensures that the device state
-           is obtained in a thread-safe manner. */
+	/* Test ROS code to publish wrenches and check for their receipt */
+	std::string name2("wrenches");
+	ros::init(argc, argv, name2);
+	ros::NodeHandle n2;
+	wrenches = n2.advertise<geometry_msgs::Wrench>("wrenches", 1000);
 
+	/* Create a listener for wrenches also */
+	std::string name3("wrenchlistener");
+	ros::init(argc, argv, name3);
+	ros::NodeHandle n3;
+	wrenchlistener = n3.subscribe("wrenches", 1000, wrenchCallback);
 
-        hdScheduleSynchronous(copyDeviceDataCallback,
-                              &currentData,
-                              HD_MIN_SCHEDULER_PRIORITY);
+	/* Synchornous call to update the force applied to the device */
+	//hdScheduleSynchronous(applyForceHD, 
+        //(void*) 0, HD_DEFAULT_SCHEDULER_PRIORITY);
 
-        if (currentData.m_buttonState && prevData.m_buttonState)
-        {
-            /* Keep track of how long the user has been pressing the button.
-               If this exceeds N ticks, then terminate the application. */
-            buttonHoldCount++;
+	/* Synchornous call to update the torque applied to the device */
+	/*hdScheduleSynchronous(applyTorqueHD, 
+        (void*) 0, HD_DEFAULT_SCHEDULER_PRIORITY);*/
 
-            if (buttonHoldCount > kTerminateCount)
-            {
-                /* Quit, since the user held the button longer than
-                   the terminate count. */
-				fclose(ofp);
-                break;
-            }
-        }
-        else if (!currentData.m_buttonState && prevData.m_buttonState)
-        {
-            /* Reset the button hold count, since the user stopped holding
-               down the stylus button. */
-            buttonHoldCount = 0;
-        }
+	ros::Rate rate(100.0);
+	while (ros::ok()){
+		hlBeginFrame();
 
-		/* If the user depresses the gimbal button, display the current 
-        location information. */
-        /*if (currentData.m_buttonState && !prevData.m_buttonState)*/
-		else 
-        {           
-            fprintf(stdout, "(r1, r2, r3, w, x, y, z, time): (%g, %g, %g, %g, %g, %g, %g, %ld)\n", 
-                currentData.m_devicePosition[0], 
-                currentData.m_devicePosition[1], 
-                currentData.m_devicePosition[2],
-				currentData.m_quaternion[0],
-				currentData.m_quaternion[1],
-				currentData.m_quaternion[2],
-				currentData.m_quaternion[3],
-				(now.wMinute*60*1000 + now.wSecond*1000 + now.wMilliseconds) - 
-				(begin.wMinute*60*1000 + begin.wSecond * 1000 + begin.wMilliseconds));
+		rosPubPose();
+		rosPubWrench(); 
+		hlPoseInfo();
+		//verifyForces(); // to confirm if forces are the ones applied 
+		//verifyTorques();
 
-			/* Also write the coordinates to the file */
+		hlEndFrame();
 
-			fprintf(stdout, "(r1, r2, r3, w, x, y, z, time): (%g, %g, %g, %g, %g, %g, %g, %ld)\n", 
-                currentData.m_devicePosition[0], 
-                currentData.m_devicePosition[1], 
-                currentData.m_devicePosition[2],
-				currentData.m_quaternion[0],
-				currentData.m_quaternion[1],
-				currentData.m_quaternion[2],
-				currentData.m_quaternion[3],
-				(now.wMinute*60*1000 + now.wSecond*1000 + now.wMilliseconds) - 
-				(begin.wMinute*60*1000 + begin.wSecond * 1000 + begin.wMilliseconds)); 
-        }
-        
-        /* Check if an error occurred. */
-        if (HD_DEVICE_ERROR(currentData.m_error))
-        {
-            hduPrintError(stderr, &currentData.m_error, "Device error detected");
+		ros::spinOnce(); 
+		rate.sleep();
+  }
 
-            if (hduIsSchedulerError(&currentData.m_error))
-            {
-                /* Quit, since communication with the device was disrupted. */
-                fprintf(stderr, "\nPress any key to quit.\n");
-                getch();                
-                break;
-            }
-        }
-
-        /* Store off the current data for the next loop. */
-        memcpy(&prevData, &currentData, sizeof(DeviceData));    
-    }
-}
-
-/*******************************************************************************
- Main function.
- Sets up the device, runs main application loop, cleans up when finished.
-*******************************************************************************/
-int main(int argc, char* argv[])
-{
-    HDSchedulerHandle hUpdateHandle = 0;
-    HDErrorInfo error;
-
-    /* Initialize the device, must be done before attempting to call any hd 
-       functions. */
-    HHD hHD = hdInitDevice(HD_DEFAULT_DEVICE);
-    if (HD_DEVICE_ERROR(error = hdGetError()))
-    {
-        hduPrintError(stderr, &error, "Failed to initialize the device");
-        fprintf(stderr, "\nPress any key to quit.\n");
-        getch();
-        return -1;           
-    }
-
-    /* Schedule the main scheduler callback that updates the device state. */
-    hUpdateHandle = hdScheduleAsynchronous(
-        updateDeviceCallback, 0, HD_MAX_SCHEDULER_PRIORITY);
-
-    /* Start the servo loop scheduler. */
-    hdStartScheduler();
-    if (HD_DEVICE_ERROR(error = hdGetError()))
-    {
-        hduPrintError(stderr, &error, "Failed to start the scheduler");
-        fprintf(stderr, "\nPress any key to quit.\n");
-        getch();
-        return -1;           
-    }
-    
-    /* Run the application loop. */
-    mainLoop();
-
-    /* For cleanup, unschedule callbacks and stop the servo loop. */
-    hdStopScheduler();
-    hdUnschedule(hUpdateHandle);
-    hdDisableDevice(hHD);
+	/* Close the file */
+	fclose(ofp);
 
     return 0;
 }
-
 /******************************************************************************/
